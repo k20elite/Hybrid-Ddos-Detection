@@ -1,4 +1,3 @@
-```markdown
 # Hybrid DDoS Detection with Statistical and Semantic Features
 
 ## Overview
@@ -9,7 +8,7 @@ This notebook (`Final.ipynb`) implements a hybrid DDoS detection framework that 
 - **Semantic embeddings** derived from a pre-trained DDoSBert model (`Thi-Thu-Huong/DDoSBert`) using HuggingFace Transformers.
 - **Logistic Regression** as a common classifier across all variants.
 
-Three model variants are evaluated on two benchmark datasets (CICDDoS2019 and AdDDoSDN):
+Four model variants are evaluated on two benchmark datasets (CICDDoS2019 and AdDDoSDN):
 
 1. **(A) Baseline: PCA + LR**  
    Logistic Regression trained on PCA-reduced tabular features (with SMOTE on the training split).
@@ -20,7 +19,10 @@ Three model variants are evaluated on two benchmark datasets (CICDDoS2019 and Ad
 3. **(C) Hybrid: Attention Fusion → LR (SMOTE)**  
    Attention-based fusion of PCA features and semantic embeddings, followed by Logistic Regression on fused features (with SMOTE).
 
-The notebook reports accuracy, macro-averaged precision, recall, and F1-score for each variant, along with confusion matrices, 5-fold cross-validation results for the hybrid variant, and t-SNE visualizations.
+4. **(D) Hybrid: Concatenation → LR (SMOTE)**  
+   Simple concatenation fusion of PCA features and semantic embeddings, followed by Logistic Regression on fused features (with SMOTE).
+
+The notebook reports accuracy, macro-averaged precision, recall, and F1-score for each variant, along with confusion matrices and 5-fold cross-validation results (for both Attention Fusion and Concatenation variants).
 
 ---
 
@@ -99,10 +101,20 @@ Key configuration constants:
 
 - `RANDOM_STATE = 42`
 - `TEST_SIZE = 0.30` (stratified 70/30 train/test split)
+- `MAX_SEQ_LEN = 128` (maximum sequence length for tokenization)
 - `PCA_VARIANCE = 0.95` (retain 95% of variance, number of components is data-dependent)
-- `N_FOLDS = 5` (for Stratified K-Fold CV on the hybrid model)
+- `N_FOLDS = 5` (for Stratified K-Fold CV on the hybrid models)
 - `LR_MAX_ITER = 1000`
 - Device auto-detection: GPU if available, else CPU.
+
+### SLM Embedding Optimization
+
+The notebook includes several optimizations for faster embedding extraction:
+
+- **FP16 Precision**: Uses half precision (`USE_FP16 = True`) for faster inference on GPU with minimal accuracy loss.
+- **Batch Processing**: Configurable batch size (`EMB_BATCH_SIZE = 128`) for better GPU utilization.
+- **Model Compilation**: Uses `torch.compile()` (`ENABLE_COMPILE = True`) for PyTorch 2.0+ optimized inference.
+- **Embedding Caching**: Caches embeddings to disk (`CACHE_EMBEDDINGS = True`) to avoid recomputation across runs.
 
 ### Data Loading and Preprocessing
 
@@ -131,12 +143,15 @@ Key configuration constants:
 - **Prompt construction** (`build_prompts`):
   - Each numeric feature vector is converted into a structured string resembling a Python dict:
     - Example: `{"' Feature1': 0.123, ' Feature2': -1.234, ...}`
+  - This format matches the structure used to fine-tune DDoSBert.
 
 - **Embedding extraction** (`extract_slm_embeddings`):
   - Uses `AutoTokenizer` and `AutoModel` from the HuggingFace model `Thi-Thu-Huong/DDoSBert`.
-  - Tokenizes prompts with truncation/padding to `MAX_SEQ_LEN`.
+  - Tokenizes prompts with truncation/padding to `MAX_SEQ_LEN = 128`.
   - Computes a **mask-weighted mean pooling** over the last hidden state to obtain one embedding per sample.
   - Executes in batches on GPU if available.
+  - Supports caching to disk to avoid recomputation.
+  - Optimized with FP16 and model compilation for faster inference.
 
 The resulting arrays `E_tr` and `E_te` are semantic embeddings of train and test samples.
 
@@ -185,23 +200,42 @@ Inference time per sample (ms) is also reported.
   - Outputs concatenated `[w * z, (1 - w) * e]`.
 - Training:
   - The fusion module is trained with a reconstruction objective (matching concatenated `[z, e]`).
+  - Training uses 5 epochs, Adam optimizer with learning rate `1e-3`, and batch size 512.
   - After training, fused features (`F_tr`, `F_te`) are computed.
   - SMOTE is applied to `F_tr` with adaptive `k_neighbors`.
   - LR is trained on the SMOTE-resampled fused features.
+- Evaluation: Metrics on `F_te` vs. original test labels.
+
+### (D) Hybrid: Concatenation → LR (SMOTE)
+
+- Inputs:
+  - Non-SMOTE PCA features (`X_tr_pca_ns`, `X_te_pca_ns`)
+  - Semantic embeddings (`E_tr`, `E_te`)
+- Fusion method (`fusion_concatenation`):
+  - Simple concatenation: `[PCA features | SLM embeddings]`
+- Training:
+  - SMOTE is applied to concatenated features `F_tr` with adaptive `k_neighbors`.
+  - LR is trained on the SMOTE-resampled concatenated features.
 - Evaluation: Metrics on `F_te` vs. original test labels.
 
 ---
 
 ## Cross-Validation and Visualization
 
-### 5-Fold Stratified Cross-Validation (Hybrid Only)
+### 5-Fold Stratified Cross-Validation
 
-Function: `run_hybrid_kfold(X_pca, E, y, dataset_name, n_folds=N_FOLDS)`
+Two cross-validation functions are provided:
 
-- Uses **StratifiedKFold** on the training portion.
+1. **`run_hybrid_kfold`**: 5-fold CV for Attention Fusion variant
+2. **`run_concat_kfold`**: 5-fold CV for Concatenation variant
+
+Both functions:
+
+- Use **StratifiedKFold** on the training portion.
 - For each fold:
-  - Trains a fusion module and Logistic Regression as above.
+  - Trains a fusion module (Attention Fusion) or concatenates features (Concatenation).
   - Applies SMOTE inside the training fold with adaptive `k_neighbors`.
+  - Trains Logistic Regression on the fused/concatenated features.
   - Evaluates on the validation fold.
 - Reports:
   - Per-fold accuracy, precision, recall, F1-score (macro-averaged).
@@ -211,38 +245,29 @@ Function: `run_hybrid_kfold(X_pca, E, y, dataset_name, n_folds=N_FOLDS)`
 
 Function: `plot_confusion_matrices(y_test, predictions, class_names, dataset_name)`
 
-- Plots confusion matrices for each variant (A, B, C) on the test set.
+- Plots confusion matrices for each variant (A, B, C, D) on the test set.
 - Uses `ConfusionMatrixDisplay` from scikit-learn.
-
-### t-SNE Visualizations
-
-Function: `plot_tsne(X_raw, X_pca, E, F_fused, y, class_names, dataset_name, max_samples=3000)`
-
-- Runs t-SNE on up to 3,000 randomly sampled points for four spaces:
-  - Raw standardized tabular features
-  - PCA space
-  - Semantic embedding space (SLM)
-  - Hybrid fused space
-- Visualizes class separation to qualitatively assess the effect of each representation.
+- Displays all matrices side-by-side for easy comparison.
 
 ---
 
 ## Notebook Usage
 
-1. **Open the notebook** `Final/Final.ipynb` in Jupyter, VS Code, or Colab.
+1. **Open the notebook** `Final.ipynb` in Jupyter, VS Code, or Colab.
 2. **Adjust dataset paths** in the `DATASETS` dictionary to point to your CSV files.
 3. (Optional) Configure a HuggingFace token in your environment to avoid download throttling.
 4. **Run all cells in order**:
    - The notebook will:
      - Install required libraries (if needed).
-     - Detect CPU/GPU.
+     - Detect CPU/GPU and enable optimizations (FP16, model compilation).
      - Load and preprocess datasets.
-     - Train and evaluate all three variants.
-     - Run 5-fold CV for the hybrid model.
-     - Generate confusion matrices and t-SNE plots.
+     - Extract semantic embeddings (with caching support).
+     - Train and evaluate all four variants (A, B, C, D).
+     - Run 5-fold CV for both Attention Fusion and Concatenation models.
+     - Generate confusion matrices.
      - Print a consolidated summary table across datasets and variants.
 
-Because SMOTE and t-SNE can be computationally expensive on large datasets, expect non-trivial runtimes, especially for embedding extraction and t-SNE.
+Because SMOTE and embedding extraction can be computationally expensive on large datasets, expect non-trivial runtimes. The embedding caching feature helps reduce recomputation time on subsequent runs.
 
 ---
 
@@ -253,16 +278,18 @@ The notebook is structured to support the following analyses:
 - **Ablation** between:
   - Purely statistical (PCA + LR),
   - Purely semantic (SLM-only + LR),
-  - Hybrid fused representations.
-- **Robustness** via 5-fold cross-validation on the hybrid variant.
-- **Qualitative understanding** via confusion matrices and t-SNE plots.
+  - Hybrid fused representations (Attention Fusion and Concatenation).
+- **Robustness** via 5-fold cross-validation on both hybrid variants.
+- **Qualitative understanding** via confusion matrices.
+- **Performance comparison** between Attention Fusion and simple Concatenation fusion strategies.
 
 Potential extensions (not implemented here but supported by the structure):
 
 - Alternative classifiers (e.g., tree-based, neural networks) on top of the same features.
 - Different imbalance handling strategies (e.g., class weighting, other resamplers).
-- Alternative fusion architectures (e.g., deeper MLPs, concatenation-only baselines).
+- Alternative fusion architectures (e.g., deeper MLPs, transformer-based fusion).
 - Cross-dataset transfer (train on one dataset, test on another).
+- Hyperparameter tuning for the fusion network and classifier.
 
 ---
 
@@ -272,7 +299,7 @@ Potential extensions (not implemented here but supported by the structure):
   - Train/test splitting,
   - SMOTE resampling,
   - KFold splitting,
-  - Random sampling for t-SNE.
+  - Random permutations in fusion training.
 - PCA retains a fixed fraction of variance (95%), so the actual number of components is dataset-dependent but deterministic given the data and seed.
 - DDoSBert parameters are loaded from HuggingFace and used as a **frozen encoder**; no fine-tuning is performed in this notebook.
-
+- Embedding caching ensures that embeddings are consistent across runs when using the same data splits.
